@@ -121,6 +121,16 @@ public class TableProperties {
   public static final String MANIFEST_MERGE_ENABLED = "commit.manifest-merge.enabled";
   public static final boolean MANIFEST_MERGE_ENABLED_DEFAULT = true;
 
+  // Enables merging a concurrently added DV into a row-level operation that also adds data files
+  // (e.g. UPDATE or MERGE) when the newly deleted positions are disjoint, instead of failing the
+  // commit. The check reads DV bitmaps on the driver only for data files this operation and a
+  // concurrent commit both added a DV to, so it is skipped entirely when the commits touch
+  // disjoint data files. Pure delete commits always merge concurrent DVs regardless of this
+  // property.
+  public static final String ROW_LEVEL_CONCURRENT_DV_MERGE_ENABLED =
+      "commit.row-level.concurrent-dv-merge.enabled";
+  public static final boolean ROW_LEVEL_CONCURRENT_DV_MERGE_ENABLED_DEFAULT = true;
+
   public static final String DEFAULT_FILE_FORMAT = "write.format.default";
   public static final String DELETE_DEFAULT_FILE_FORMAT = "write.delete.format.default";
   public static final String DEFAULT_FILE_FORMAT_DEFAULT = "parquet";

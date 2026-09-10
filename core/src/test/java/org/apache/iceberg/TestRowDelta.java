@@ -2149,24 +2149,239 @@ public class TestRowDelta extends TestBase {
   }
 
   @TestTemplate
-  public void testConcurrentDVNotMergedWhenAddingDataFiles() {
+  public void testConcurrentDisjointDVMergedWhenAddingDataFiles() throws IOException {
     assumeThat(formatVersion).isGreaterThanOrEqualTo(3);
 
     DataFile dataFile = newDataFile("data_bucket=0");
     commit(table, table.newRowDelta().addRows(dataFile), branch);
 
-    DeleteFile deleteFile1 = newDeletes(dataFile);
-    RowDelta rowDelta1 = table.newRowDelta().addDeletes(deleteFile1);
+    OutputFileFactory fileFactory =
+        OutputFileFactory.builderFor(table, 1, 1).format(FileFormat.PUFFIN).build();
 
-    DeleteFile deleteFile2 = newDeletes(dataFile);
-    RowDelta rowDelta2 =
-        table.newRowDelta().addRows(newDataFile("data_bucket=1")).addDeletes(deleteFile2);
+    // a concurrent delete removes rows 0-1
+    DeleteFile concurrentDV = dvWithPositions(dataFile, fileFactory, 0, 2);
+    RowDelta concurrent = table.newRowDelta().addDeletes(concurrentDV);
 
-    commit(table, rowDelta1, branch);
+    // this operation rewrites rows 2-3 into a new data file; its deletes are disjoint from the
+    // concurrent delete, so the concurrent DV must be merged instead of failing
+    DeleteFile updateDV = dvWithPositions(dataFile, fileFactory, 2, 4);
+    RowDelta update =
+        table.newRowDelta().addRows(newDataFile("data_bucket=1")).addDeletes(updateDV);
 
-    assertThatThrownBy(() -> commit(table, rowDelta2, branch))
+    commit(table, concurrent, branch);
+    commit(table, update, branch);
+
+    SnapshotChanges changes =
+        SnapshotChanges.builderFor(table).snapshot(latestSnapshot(table, branch)).build();
+
+    DeleteFile mergedDV = Iterables.getOnlyElement(changes.addedDeleteFiles());
+    assertDVHasDeletedPositions(mergedDV, LongStream.range(0, 4).boxed()::iterator);
+    assertThat(changes.removedDeleteFiles())
+        .extracting(ContentFile::location)
+        .containsExactly(concurrentDV.location());
+  }
+
+  @TestTemplate
+  public void testConcurrentOverlappingDVFailsWhenAddingDataFiles() throws IOException {
+    assumeThat(formatVersion).isGreaterThanOrEqualTo(3);
+
+    DataFile dataFile = newDataFile("data_bucket=0");
+    commit(table, table.newRowDelta().addRows(dataFile), branch);
+
+    OutputFileFactory fileFactory =
+        OutputFileFactory.builderFor(table, 1, 1).format(FileFormat.PUFFIN).build();
+
+    // a concurrent delete removes rows 0-2
+    DeleteFile concurrentDV = dvWithPositions(dataFile, fileFactory, 0, 3);
+    RowDelta concurrent = table.newRowDelta().addDeletes(concurrentDV);
+
+    // this operation rewrites rows 2-3 into a new data file; row 2 is also deleted concurrently, so
+    // merging would let the row be both rewritten here and deleted concurrently
+    DeleteFile updateDV = dvWithPositions(dataFile, fileFactory, 2, 4);
+    RowDelta update =
+        table.newRowDelta().addRows(newDataFile("data_bucket=1")).addDeletes(updateDV);
+
+    commit(table, concurrent, branch);
+
+    assertThatThrownBy(() -> commit(table, update, branch))
         .isInstanceOf(ValidationException.class)
-        .hasMessageContaining("Found concurrently added DV for %s", dataFile.location());
+        .hasMessageContaining("Found concurrently added DV for %s", dataFile.location())
+        .hasMessageContaining("also deleted by this operation");
+  }
+
+  @TestTemplate
+  public void testConcurrentDisjointDVNotMergedWhenRowLevelMergeDisabled() throws IOException {
+    assumeThat(formatVersion).isGreaterThanOrEqualTo(3);
+
+    table
+        .updateProperties()
+        .set(TableProperties.ROW_LEVEL_CONCURRENT_DV_MERGE_ENABLED, "false")
+        .commit();
+
+    DataFile dataFile = newDataFile("data_bucket=0");
+    commit(table, table.newRowDelta().addRows(dataFile), branch);
+
+    OutputFileFactory fileFactory =
+        OutputFileFactory.builderFor(table, 1, 1).format(FileFormat.PUFFIN).build();
+
+    // the deleted positions are disjoint, so this would merge when the property is enabled
+    DeleteFile concurrentDV = dvWithPositions(dataFile, fileFactory, 0, 2);
+    RowDelta concurrent = table.newRowDelta().addDeletes(concurrentDV);
+
+    DeleteFile updateDV = dvWithPositions(dataFile, fileFactory, 2, 4);
+    RowDelta update =
+        table.newRowDelta().addRows(newDataFile("data_bucket=1")).addDeletes(updateDV);
+
+    commit(table, concurrent, branch);
+
+    // with the merge disabled, an operation that adds data files falls back to failing on any
+    // concurrent DV for a data file it also added a DV to, without comparing positions
+    assertThatThrownBy(() -> commit(table, update, branch))
+        .isInstanceOf(ValidationException.class)
+        .hasMessageContaining("Found concurrently added DV for %s", dataFile.location())
+        .hasMessageNotContaining("also deleted by this operation");
+  }
+
+  @TestTemplate
+  public void testConcurrentDVSharingOnlyBaseDeletionMergedWhenAddingDataFiles()
+      throws IOException {
+    assumeThat(formatVersion).isGreaterThanOrEqualTo(3);
+
+    DataFile dataFile = newDataFile("data_bucket=0");
+    commit(table, table.newRowDelta().addRows(dataFile), branch);
+
+    OutputFileFactory fileFactory =
+        OutputFileFactory.builderFor(table, 1, 1).format(FileFormat.PUFFIN).build();
+
+    // row 0 is already deleted at the base snapshot both operations start from
+    DeleteFile existingDV = dvWithPositions(dataFile, fileFactory, 0, 1);
+    commit(table, table.newRowDelta().addDeletes(existingDV), branch);
+    Snapshot base = latestSnapshot(table, branch);
+
+    // a concurrent delete supersedes the base DV and additionally removes row 1
+    DeleteFile concurrentDV = dvWithExplicitPositions(dataFile, fileFactory, 0L, 1L);
+    RowDelta concurrent =
+        table
+            .newRowDelta()
+            .addDeletes(concurrentDV)
+            .removeDeletes(existingDV)
+            .validateFromSnapshot(base.snapshotId());
+
+    // this operation rewrites row 2 into a new data file; its DV supersedes the base DV.
+    // row 0 is shared with the concurrent DV only because both inherited it from the base DV.
+    // after subtracting the base, the newly deleted positions (1 and 2) are disjoint, so it merges
+    DeleteFile updateDV = dvWithExplicitPositions(dataFile, fileFactory, 0L, 2L);
+    RowDelta update =
+        table
+            .newRowDelta()
+            .addRows(newDataFile("data_bucket=1"))
+            .addDeletes(updateDV)
+            .removeDeletes(existingDV)
+            .validateFromSnapshot(base.snapshotId());
+
+    commit(table, concurrent, branch);
+    commit(table, update, branch);
+
+    SnapshotChanges changes =
+        SnapshotChanges.builderFor(table).snapshot(latestSnapshot(table, branch)).build();
+
+    DeleteFile mergedDV = Iterables.getOnlyElement(changes.addedDeleteFiles());
+    assertDVHasDeletedPositions(mergedDV, LongStream.range(0, 3).boxed()::iterator);
+    assertThat(changes.removedDeleteFiles())
+        .extracting(ContentFile::location)
+        .containsExactly(concurrentDV.location());
+  }
+
+  @TestTemplate
+  public void testConcurrentDVConflictingOnNewPositionFailsWithBaseWhenAddingDataFiles()
+      throws IOException {
+    assumeThat(formatVersion).isGreaterThanOrEqualTo(3);
+
+    DataFile dataFile = newDataFile("data_bucket=0");
+    commit(table, table.newRowDelta().addRows(dataFile), branch);
+
+    OutputFileFactory fileFactory =
+        OutputFileFactory.builderFor(table, 1, 1).format(FileFormat.PUFFIN).build();
+
+    // row 0 is already deleted at the base snapshot both operations start from
+    DeleteFile existingDV = dvWithPositions(dataFile, fileFactory, 0, 1);
+    commit(table, table.newRowDelta().addDeletes(existingDV), branch);
+    Snapshot base = latestSnapshot(table, branch);
+
+    // a concurrent delete supersedes the base DV and additionally removes row 1
+    DeleteFile concurrentDV = dvWithExplicitPositions(dataFile, fileFactory, 0L, 1L);
+    RowDelta concurrent =
+        table
+            .newRowDelta()
+            .addDeletes(concurrentDV)
+            .removeDeletes(existingDV)
+            .validateFromSnapshot(base.snapshotId());
+
+    // this operation rewrites row 1 into a new data file; its DV supersedes the base DV.
+    // row 1 is newly deleted by both operations and is not part of the base, so subtracting the
+    // base still leaves a real conflict and the merge must fail
+    DeleteFile updateDV = dvWithExplicitPositions(dataFile, fileFactory, 0L, 1L);
+    RowDelta update =
+        table
+            .newRowDelta()
+            .addRows(newDataFile("data_bucket=1"))
+            .addDeletes(updateDV)
+            .removeDeletes(existingDV)
+            .validateFromSnapshot(base.snapshotId());
+
+    commit(table, concurrent, branch);
+
+    assertThatThrownBy(() -> commit(table, update, branch))
+        .isInstanceOf(ValidationException.class)
+        .hasMessageContaining("Found concurrently added DV for %s", dataFile.location())
+        .hasMessageContaining("also deleted by this operation");
+  }
+
+  @TestTemplate
+  public void testConcurrentDisjointDVWithBaseMergedOnRetryWhenAddingDataFiles()
+      throws IOException {
+    assumeThat(formatVersion).isGreaterThanOrEqualTo(3);
+
+    DataFile dataFile = newDataFile("data_bucket=0");
+    commit(table, table.newRowDelta().addRows(dataFile), branch);
+
+    OutputFileFactory fileFactory =
+        OutputFileFactory.builderFor(table, 1, 1).format(FileFormat.PUFFIN).build();
+
+    // row 0 is already deleted at the base snapshot both operations start from
+    DeleteFile existingDV = dvWithPositions(dataFile, fileFactory, 0, 1);
+    commit(table, table.newRowDelta().addDeletes(existingDV), branch);
+    Snapshot base = latestSnapshot(table, branch);
+
+    DeleteFile concurrentDV = dvWithExplicitPositions(dataFile, fileFactory, 0L, 1L);
+    RowDelta concurrent =
+        table
+            .newRowDelta()
+            .addDeletes(concurrentDV)
+            .removeDeletes(existingDV)
+            .validateFromSnapshot(base.snapshotId());
+
+    DeleteFile updateDV = dvWithExplicitPositions(dataFile, fileFactory, 0L, 2L);
+    RowDelta update =
+        table
+            .newRowDelta()
+            .addRows(newDataFile("data_bucket=1"))
+            .addDeletes(updateDV)
+            .removeDeletes(existingDV)
+            .validateFromSnapshot(base.snapshotId());
+
+    commit(table, concurrent, branch);
+
+    // on retry the same concurrent DV is recognized as already merged, so the disjoint update's
+    // merged result is committed once without being validated or applied a second time
+    table.ops().failCommits(1);
+    commit(table, update, branch);
+
+    SnapshotChanges changes =
+        SnapshotChanges.builderFor(table).snapshot(latestSnapshot(table, branch)).build();
+
+    DeleteFile mergedDV = Iterables.getOnlyElement(changes.addedDeleteFiles());
+    assertDVHasDeletedPositions(mergedDV, LongStream.range(0, 3).boxed()::iterator);
   }
 
   @TestTemplate
@@ -2930,6 +3145,16 @@ public class TestRowDelta extends TestBase {
     }
 
     return writeDV(targetTable, deletes, dataFile.specId(), dataFile.partition(), fileFactory);
+  }
+
+  private DeleteFile dvWithExplicitPositions(
+      DataFile dataFile, OutputFileFactory fileFactory, long... positions) throws IOException {
+    List<PositionDelete<?>> deletes = Lists.newArrayList();
+    for (long pos : positions) {
+      deletes.add(PositionDelete.create().set(dataFile.location(), pos));
+    }
+
+    return writeDV(table, deletes, dataFile.specId(), dataFile.partition(), fileFactory);
   }
 
   private void assertDVHasDeletedPositions(DeleteFile dv, Iterable<Long> positions) {

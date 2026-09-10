@@ -33,6 +33,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
+import org.apache.iceberg.deletes.PositionDeleteIndex;
 import org.apache.iceberg.encryption.EncryptedOutputFile;
 import org.apache.iceberg.encryption.EncryptingFileIO;
 import org.apache.iceberg.events.CreateSnapshotEvent;
@@ -100,6 +101,10 @@ abstract class MergingSnapshotProducer<ThisT> extends SnapshotProducer<ThisT> {
   private final Map<String, List<DeleteFile>> dvsByReferencedFile = Maps.newLinkedHashMap();
   private final Map<String, DeleteFile> mergedConcurrentDVsByFile = Maps.newHashMap();
   private final List<String> mergedDVFileLocations = Lists.newArrayList();
+  // positions deleted at this operation's starting snapshot for a referenced data file (the DVs it
+  // supersedes); captured once because merging a concurrent DV mutates the pending removals
+  private final Map<String, List<PositionDeleteIndex>> basePositionsByReferencedFile =
+      Maps.newHashMap();
   private final List<ManifestFile> appendManifests = Lists.newArrayList();
   private final List<ManifestFile> rewrittenAppendManifests = Lists.newArrayList();
   private final SnapshotSummary.Builder addedDataFilesSummary = SnapshotSummary.builder();
@@ -833,6 +838,16 @@ abstract class MergingSnapshotProducer<ThisT> extends SnapshotProducer<ThisT> {
     return false;
   }
 
+  /**
+   * Whether a concurrently added DV merged into this operation's DVs must have deleted positions
+   * that are disjoint from this operation's own deleted positions. When true, a concurrent DV whose
+   * newly deleted positions overlap this operation's newly deleted positions fails validation
+   * instead of being merged.
+   */
+  protected boolean mergedConcurrentDVsMustBeDisjoint() {
+    return false;
+  }
+
   // validates there are no concurrently added DVs for referenced data files, or merges the
   // concurrent DVs into this operation's DVs if merging is allowed
   protected void validateAddedDVs(
@@ -954,6 +969,10 @@ abstract class MergingSnapshotProducer<ThisT> extends SnapshotProducer<ThisT> {
         dvsByReferencedFile.get(referencedDataFile).remove(previouslyMerged);
       }
 
+      if (mergedConcurrentDVsMustBeDisjoint()) {
+        validateDisjointConcurrentDV(referencedDataFile, concurrentDV);
+      }
+
       LOG.info(
           "Merging concurrently added DV {} for {} into the new DV in table {}",
           concurrentDV.location(),
@@ -972,6 +991,77 @@ abstract class MergingSnapshotProducer<ThisT> extends SnapshotProducer<ThisT> {
       delete(concurrentDV);
       this.hasNewDeleteFiles = true;
     }
+  }
+
+  /**
+   * Validates that a concurrently added DV deletes no position that this operation also newly
+   * deletes for the same data file. Positions already deleted at this operation's starting snapshot
+   * (the DVs this operation supersedes and removes) are shared by both DVs and are not a conflict;
+   * they are subtracted before comparing.
+   */
+  private void validateDisjointConcurrentDV(String referencedDataFile, DeleteFile concurrentDV) {
+    FileIO io = EncryptingFileIO.combine(ops().io(), ops().encryption());
+    PositionDeleteIndex concurrentPositions = DVUtil.readDV(concurrentDV, io);
+    List<PositionDeleteIndex> basePositions = basePositions(referencedDataFile, io);
+
+    for (DeleteFile ownDV : dvsByReferencedFile.get(referencedDataFile)) {
+      long overlap =
+          overlappingPositionCount(DVUtil.readDV(ownDV, io), concurrentPositions, basePositions);
+      ValidationException.check(
+          overlap == 0,
+          "Found concurrently added DV for %s that deletes %s position(s) also deleted by this operation: %s",
+          referencedDataFile,
+          overlap,
+          ContentFileUtil.dvDesc(concurrentDV));
+    }
+  }
+
+  /**
+   * Returns the positions already deleted at this operation's starting snapshot for a referenced
+   * data file (the DVs this operation supersedes). These DVs are fixed when the operation is built,
+   * so their positions are read once and cached per referenced file. Merging a concurrent DV drops
+   * the superseded DVs from the pending removals and adds the merged DV in their place, so on a
+   * later commit attempt the pending removals no longer identify this operation's base.
+   */
+  private List<PositionDeleteIndex> basePositions(String referencedDataFile, FileIO io) {
+    return basePositionsByReferencedFile.computeIfAbsent(
+        referencedDataFile,
+        file -> {
+          List<PositionDeleteIndex> positions = Lists.newArrayList();
+          for (DeleteFile removed : deleteFilterManager.filesToBeDeleted()) {
+            if (file.equals(removed.referencedDataFile()) && ContentFileUtil.isDV(removed)) {
+              positions.add(DVUtil.readDV(removed, io));
+            }
+          }
+          return positions;
+        });
+  }
+
+  // counts positions deleted by both DVs that were not already deleted at the starting snapshot
+  private static long overlappingPositionCount(
+      PositionDeleteIndex self, PositionDeleteIndex concurrent, List<PositionDeleteIndex> base) {
+    // iterate the smaller index and probe the larger to keep the scan proportional to the smaller
+    // DV
+    PositionDeleteIndex smaller =
+        self.cardinality() <= concurrent.cardinality() ? self : concurrent;
+    PositionDeleteIndex larger = smaller == self ? concurrent : self;
+    long[] overlap = {0L};
+    smaller.forEach(
+        position -> {
+          if (larger.isDeleted(position) && !isDeletedIn(base, position)) {
+            overlap[0] += 1L;
+          }
+        });
+    return overlap[0];
+  }
+
+  private static boolean isDeletedIn(List<PositionDeleteIndex> indexes, long position) {
+    for (PositionDeleteIndex index : indexes) {
+      if (index.isDeleted(position)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static boolean isSameDV(DeleteFile dv1, DeleteFile dv2) {
