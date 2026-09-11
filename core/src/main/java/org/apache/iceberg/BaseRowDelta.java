@@ -174,13 +174,43 @@ public class BaseRowDelta extends MergingSnapshotProducer<RowDelta> implements R
   }
 
   /**
-   * Concurrently added DVs can be merged into this operation's DVs only when this operation does
-   * not add or remove data files and does not require concurrent delete files to fail via {@link
-   * #validateNoConflictingDeleteFiles()}.
+   * Concurrently added DVs can be merged into this operation's DVs when this operation does not
+   * remove data files and does not require concurrent delete files to fail via {@link
+   * #validateNoConflictingDeleteFiles()}. Removing data files makes concurrent positions on those
+   * files meaningless, so merging is disabled in that case.
+   *
+   * <p>Pure delete commits always merge concurrent DVs because deletes are commutative. Operations
+   * that also add data files (e.g. UPDATE or MERGE) can merge a concurrent DV only when its newly
+   * deleted positions are disjoint from this operation's own deleted positions (see {@link
+   * #mergedConcurrentDVsMustBeDisjoint()}), and only when {@link
+   * TableProperties#ROW_LEVEL_CONCURRENT_DV_MERGE_ENABLED} is enabled.
    */
   @Override
   protected boolean canMergeConcurrentDVs() {
-    return !validateNewDeleteFiles && !addsDataFiles() && !deletesDataFiles();
+    if (validateNewDeleteFiles || deletesDataFiles()) {
+      return false;
+    }
+
+    if (addsDataFiles()) {
+      return ops()
+          .current()
+          .propertyAsBoolean(
+              TableProperties.ROW_LEVEL_CONCURRENT_DV_MERGE_ENABLED,
+              TableProperties.ROW_LEVEL_CONCURRENT_DV_MERGE_ENABLED_DEFAULT);
+    }
+
+    return true;
+  }
+
+  /**
+   * Deletes are commutative, so an operation that only adds DVs may union any concurrent DV. An
+   * operation that also rewrites rows into new data files (e.g. UPDATE or MERGE) can only union a
+   * concurrent DV when the newly deleted positions are disjoint; otherwise the same row would be
+   * both rewritten here and deleted concurrently.
+   */
+  @Override
+  protected boolean mergedConcurrentDVsMustBeDisjoint() {
+    return addsDataFiles();
   }
 
   /**
